@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const { ethers } = require('ethers');
+const path = require('path');
 
 const db = require('./db');
 const {
@@ -21,12 +22,27 @@ const PLATFORM_FEE_TOKEN = process.env.PLATFORM_FEE_TOKEN || '1';
 const USDC_TOKEN_ADDRESS = process.env.USDC_TOKEN_ADDRESS || null;
 const USDC_TOKEN_DECIMALS = parseInt(process.env.USDC_TOKEN_DECIMALS || '6', 10);
 
+// Admin token (use a strong secret in production via env)
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'changeme';
+
 const provider = createProvider(RPC_URL);
 const wallet = createWallet(PRIVATE_KEY, provider);
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+
+// Simple admin auth middleware (PoC only)
+function adminAuth(req, res, next) {
+  const auth = req.headers['authorization'] || '';
+  if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+  const token = auth.slice(7);
+  if (token !== ADMIN_TOKEN) return res.status(403).json({ error: 'Forbidden' });
+  next();
+}
+
+// Serve admin static build if present
+app.use('/admin', express.static(path.join(__dirname, 'admin', 'build')));
 
 function insertWithdrawal(obj) {
   const now = new Date().toISOString();
@@ -38,6 +54,15 @@ function insertWithdrawal(obj) {
   obj.updated_at = now;
   stmt.run(obj);
 }
+
+// Admin endpoint: list withdrawals (optional filter by status)
+app.get('/admin/withdrawals', adminAuth, (req, res) => {
+  const status = req.query.status || null;
+  let rows;
+  if (status) rows = db.prepare('SELECT * FROM withdrawals WHERE status = ? ORDER BY created_at DESC').all(status);
+  else rows = db.prepare('SELECT * FROM withdrawals ORDER BY created_at DESC LIMIT 200').all();
+  res.json(rows);
+});
 
 app.post('/withdrawals/create', async (req, res) => {
   try {
