@@ -6,8 +6,10 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const { ethers } = require('ethers');
 
 const db = require('./db');
+const { createProvider, createWallet, sendERC20 } = require('./payouts');
 
 const app = express();
 app.use(cors());
@@ -17,6 +19,25 @@ app.use(express.static(path.join(__dirname, 'public')));
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme_clicker_jwt';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'changeme_admin_token';
+
+const RPC_URL = process.env.RPC_URL || null;
+const PRIVATE_KEY = process.env.PRIVATE_KEY || null;
+const USDC_TOKEN_ADDRESS = process.env.USDC_TOKEN_ADDRESS || null;
+const USDC_TOKEN_DECIMALS = parseInt(process.env.USDC_TOKEN_DECIMALS || '6', 10);
+
+let provider = null;
+let wallet = null;
+if(RPC_URL && PRIVATE_KEY){
+  try{
+    provider = createProvider(RPC_URL);
+    wallet = createWallet(PRIVATE_KEY, provider);
+    console.log('Blockchain provider and wallet initialized.');
+  }catch(e){
+    console.error('Failed to init provider/wallet:', e.message);
+  }
+} else {
+  console.log('RPC_URL or PRIVATE_KEY not set — onchain transfers disabled until configured.');
+}
 
 function now(){ return new Date().toISOString(); }
 
@@ -126,8 +147,8 @@ app.post('/game/submit', requireAuth, (req,res)=>{
       .run(clicks, duration, rewardStr, 'submitted', now(), roundId);
 
     // credit user wallet
-    const wallet = getWallet(req.user.id);
-    const newBalance = (parseFloat(wallet.balance || '0') + parseFloat(rewardStr)).toFixed(6);
+    const walletRow = getWallet(req.user.id);
+    const newBalance = (parseFloat(walletRow.balance || '0') + parseFloat(rewardStr)).toFixed(6);
     updateWalletBalance(req.user.id, newBalance);
 
     return res.json({ reward: rewardStr, balance: newBalance });
@@ -140,23 +161,23 @@ app.post('/game/submit', requireAuth, (req,res)=>{
 // get profile
 app.get('/me', requireAuth, (req,res)=>{
   const user = getUserById(req.user.id);
-  const wallet = getWallet(req.user.id);
-  return res.json({ user: { id: user.id, email: user.email, created_at: user.created_at }, wallet });
+  const walletRow = getWallet(req.user.id);
+  return res.json({ user: { id: user.id, email: user.email, created_at: user.created_at }, wallet: walletRow });
 });
 
 // create withdrawal request
 app.post('/withdrawals/create', requireAuth, (req,res)=>{
   const { amount, destination } = req.body || {};
   if(!amount || !destination) return res.status(400).json({ error: 'amount and destination required' });
-  const wallet = getWallet(req.user.id);
-  const balance = parseFloat(wallet.balance || '0');
+  const walletRow = getWallet(req.user.id);
+  const balance = parseFloat(walletRow.balance || '0');
   const amt = parseFloat(amount);
   if(amt <= 0) return res.status(400).json({ error: 'invalid amount' });
   if(amt > balance) return res.status(400).json({ error: 'insufficient balance' });
 
   // lock amount
   const newBalance = (balance - amt).toFixed(6);
-  const newLocked = (parseFloat(wallet.locked || '0') + amt).toFixed(6);
+  const newLocked = (parseFloat(walletRow.locked || '0') + amt).toFixed(6);
   db.prepare('UPDATE wallets SET balance = ?, locked = ? WHERE user_id = ?').run(newBalance, newLocked, req.user.id);
 
   const id = uuidv4();
@@ -174,29 +195,84 @@ app.get('/admin/withdrawals', requireAdmin, (req,res)=>{
   return res.json(rows);
 });
 
-// admin confirm withdrawal (this PoC does not broadcast on-chain; it simulates txHash)
-app.post('/admin/withdrawals/:id/confirm', requireAdmin, (req,res)=>{
+// admin confirm withdrawal (now performs on-chain ERC20 transfer when configured)
+app.post('/admin/withdrawals/:id/confirm', requireAdmin, async (req,res)=>{
   const id = req.params.id;
   const row = db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
   if(!row) return res.status(404).json({ error: 'withdrawal not found' });
   if(row.status !== 'pending') return res.status(400).json({ error: 'not pending' });
 
-  // mark broadcast/completed and decrement locked
-  const txHash = 'POC_TX_' + uuidv4().slice(0,8);
-  db.prepare('UPDATE withdrawals SET status = ?, tx_hash = ?, updated_at = ? WHERE id = ?')
-    .run('completed', txHash, now(), id);
+  if(!provider || !wallet || !USDC_TOKEN_ADDRESS){
+    // fallback: simulate tx (previous PoC behaviour)
+    const txHash = 'POC_TX_' + uuidv4().slice(0,8);
+    db.prepare('UPDATE withdrawals SET status = ?, tx_hash = ?, updated_at = ? WHERE id = ?')
+      .run('completed', txHash, now(), id);
 
-  // reduce locked
-  const wallet = getWallet(row.user_id);
-  const newLocked = (parseFloat(wallet.locked || '0') - parseFloat(row.amount)).toFixed(6);
-  db.prepare('UPDATE wallets SET locked = ? WHERE user_id = ?').run(newLocked, row.user_id);
+    // reduce locked
+    const walletRow = getWallet(row.user_id);
+    const newLocked = (parseFloat(walletRow.locked || '0') - parseFloat(row.amount)).toFixed(6);
+    db.prepare('UPDATE wallets SET locked = ? WHERE user_id = ?').run(newLocked, row.user_id);
 
-  // audit
-  const auditId = uuidv4();
-  db.prepare('INSERT INTO admin_audit (id,actor,action,target_id,details,created_at) VALUES (?,?,?,?,?,?)')
-    .run(auditId, 'admin', 'withdraw_confirm', id, JSON.stringify({ txHash }), now());
+    // audit
+    const auditId = uuidv4();
+    db.prepare('INSERT INTO admin_audit (id,actor,action,target_id,details,created_at) VALUES (?,?,?,?,?,?)')
+      .run(auditId, 'admin', 'withdraw_confirm_simulated', id, JSON.stringify({ txHash }), now());
 
-  return res.json({ id, txHash, status: 'completed' });
+    return res.json({ id, txHash, status: 'completed', simulated: true });
+  }
+
+  // Perform on-chain USDC transfer
+  try{
+    // amount is decimal string in USDC units
+    const amountDecimal = String(row.amount);
+    const amountUnits = ethers.parseUnits(amountDecimal, USDC_TOKEN_DECIMALS);
+
+    // check token balance
+    const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
+    const tokenContract = new ethers.Contract(USDC_TOKEN_ADDRESS, ERC20_ABI, provider);
+    const tokenBalance = await tokenContract.balanceOf(wallet.address);
+    if(tokenBalance < amountUnits){
+      db.prepare('UPDATE withdrawals SET status = ?, updated_at = ? WHERE id = ?')
+        .run('failed', now(), id);
+      return res.status(400).json({ error: 'platform token balance insufficient' });
+    }
+
+    // check native balance for gas (require at least 0.0005 MATIC as safety)
+    const nativeBalance = await provider.getBalance(wallet.address);
+    const minNative = ethers.parseEther('0.0005');
+    if(nativeBalance < minNative){
+      db.prepare('UPDATE withdrawals SET status = ?, updated_at = ? WHERE id = ?')
+        .run('failed', now(), id);
+      return res.status(400).json({ error: 'platform native balance insufficient for gas' });
+    }
+
+    // send
+    db.prepare('UPDATE withdrawals SET status = ?, updated_at = ? WHERE id = ?').run('broadcasting', now(), id);
+    const { txHash, receipt } = await sendERC20(provider, wallet, USDC_TOKEN_ADDRESS, row.destination, amountUnits);
+
+    db.prepare('UPDATE withdrawals SET status = ?, tx_hash = ?, updated_at = ? WHERE id = ?')
+      .run('completed', txHash, now(), id);
+
+    // reduce locked
+    const walletRow = getWallet(row.user_id);
+    const newLocked = (parseFloat(walletRow.locked || '0') - parseFloat(row.amount)).toFixed(6);
+    db.prepare('UPDATE wallets SET locked = ? WHERE user_id = ?').run(newLocked, row.user_id);
+
+    // audit
+    const auditId = uuidv4();
+    db.prepare('INSERT INTO admin_audit (id,actor,action,target_id,details,created_at) VALUES (?,?,?,?,?,?)')
+      .run(auditId, 'admin', 'withdraw_onchain', id, JSON.stringify({ txHash, receipt: { blockNumber: receipt.blockNumber, status: receipt.status } }), now());
+
+    return res.json({ id, txHash, status: 'completed' });
+  }catch(e){
+    console.error('onchain transfer failed', e);
+    db.prepare('UPDATE withdrawals SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?')
+      .run('failed', String(e), now(), id);
+    const auditId = uuidv4();
+    db.prepare('INSERT INTO admin_audit (id,actor,action,target_id,details,created_at) VALUES (?,?,?,?,?,?)')
+      .run(auditId, 'admin', 'withdraw_onchain_failed', id, JSON.stringify({ error: String(e) }), now());
+    return res.status(500).json({ error: String(e) });
+  }
 });
 
 // admin audit
