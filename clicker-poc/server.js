@@ -218,7 +218,7 @@ app.post('/admin/withdrawals/:id/confirm', requireAdmin, async (req,res)=>{
     db.prepare('INSERT INTO admin_audit (id,actor,action,target_id,details,created_at) VALUES (?,?,?,?,?,?)')
       .run(auditId, 'admin', 'withdraw_confirm_simulated', id, JSON.stringify({ txHash }), now());
 
-    return res.json({ id, txHash, status: 'completed', simulated: true });
+    return res.json({ id, txHash, status: 'completed', simulated: true, receipt: null });
   }
 
   // Perform on-chain USDC transfer
@@ -250,6 +250,19 @@ app.post('/admin/withdrawals/:id/confirm', requireAdmin, async (req,res)=>{
     db.prepare('UPDATE withdrawals SET status = ?, updated_at = ? WHERE id = ?').run('broadcasting', now(), id);
     const { txHash, receipt } = await sendERC20(provider, wallet, USDC_TOKEN_ADDRESS, row.destination, amountUnits);
 
+    // process receipt fields for JSON safety (BigInt -> string)
+    const processedReceipt = {
+      blockNumber: receipt.blockNumber ?? null,
+      transactionHash: txHash,
+      status: receipt.status ?? null,
+      confirmations: receipt.confirmations ?? null,
+      gasUsed: receipt.gasUsed ? String(receipt.gasUsed) : null,
+      effectiveGasPrice: receipt.effectiveGasPrice ? String(receipt.effectiveGasPrice) : null,
+      logsCount: receipt.logs ? receipt.logs.length : null
+    };
+
+    console.log('On-chain transfer completed:', processedReceipt);
+
     db.prepare('UPDATE withdrawals SET status = ?, tx_hash = ?, updated_at = ? WHERE id = ?')
       .run('completed', txHash, now(), id);
 
@@ -261,9 +274,9 @@ app.post('/admin/withdrawals/:id/confirm', requireAdmin, async (req,res)=>{
     // audit
     const auditId = uuidv4();
     db.prepare('INSERT INTO admin_audit (id,actor,action,target_id,details,created_at) VALUES (?,?,?,?,?,?)')
-      .run(auditId, 'admin', 'withdraw_onchain', id, JSON.stringify({ txHash, receipt: { blockNumber: receipt.blockNumber, status: receipt.status } }), now());
+      .run(auditId, 'admin', 'withdraw_onchain', id, JSON.stringify({ txHash, receipt: processedReceipt }), now());
 
-    return res.json({ id, txHash, status: 'completed' });
+    return res.json({ id, txHash, status: 'completed', receipt: processedReceipt });
   }catch(e){
     console.error('onchain transfer failed', e);
     db.prepare('UPDATE withdrawals SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?')
