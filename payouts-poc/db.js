@@ -22,4 +22,17 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 )
 `).run();
 
+// Audit table for admin actions
+db.prepare(`
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id TEXT PRIMARY KEY,
+  admin_token TEXT,
+  action TEXT,
+  withdrawal_id TEXT,
+  tx_hash TEXT,
+  details TEXT,
+  created_at TEXT
+)
+`).run();
+
 module.exports = db;

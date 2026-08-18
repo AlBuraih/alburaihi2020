@@ -38,7 +38,22 @@ function adminAuth(req, res, next) {
   if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
   const token = auth.slice(7);
   if (token !== ADMIN_TOKEN) return res.status(403).json({ error: 'Forbidden' });
+  // record token for audit
+  req.admin = { token };
   next();
+}
+
+// helper: log audit
+function logAudit(adminToken, action, withdrawalId, txHash, details) {
+  try {
+    const now = new Date().toISOString();
+    const id = uuidv4();
+    db.prepare(`INSERT INTO admin_audit (id, admin_token, action, withdrawal_id, tx_hash, details, created_at) VALUES (@id,@admin_token,@action,@withdrawal_id,@tx_hash,@details,@created_at)`).run({
+      id, admin_token: adminToken, action, withdrawal_id: withdrawalId, tx_hash: txHash || null, details: details || null, created_at: now
+    });
+  } catch (e) {
+    console.error('audit log failed', e);
+  }
 }
 
 // Serve admin static build if present
@@ -61,6 +76,12 @@ app.get('/admin/withdrawals', adminAuth, (req, res) => {
   let rows;
   if (status) rows = db.prepare('SELECT * FROM withdrawals WHERE status = ? ORDER BY created_at DESC').all(status);
   else rows = db.prepare('SELECT * FROM withdrawals ORDER BY created_at DESC LIMIT 200').all();
+  res.json(rows);
+});
+
+// Admin endpoint: audit log
+app.get('/admin/audit', adminAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM admin_audit ORDER BY created_at DESC LIMIT 500').all();
   res.json(rows);
 });
 
@@ -130,12 +151,18 @@ app.post('/withdrawals/create', async (req, res) => {
   }
 });
 
-app.post('/withdrawals/:id/confirm', async (req, res) => {
+// Require adminAuth for confirm so we can audit who approved/executed
+app.post('/withdrawals/:id/confirm', adminAuth, async (req, res) => {
   try {
     const id = req.params.id;
+    const performedBy = req.admin && req.admin.token ? req.admin.token : 'unknown';
+
     const row = db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
     if (!row) return res.status(404).json({ error: 'withdrawal not found' });
     if (row.status !== 'pending') return res.status(400).json({ error: 'withdrawal not pending' });
+
+    // log attempt
+    logAudit(performedBy, 'approve_attempt', id, null, JSON.stringify({ ip: req.ip }));
 
     db.prepare('UPDATE withdrawals SET status = ?, updated_at = ? WHERE id = ?').run('approved', new Date().toISOString(), id);
 
@@ -147,6 +174,7 @@ app.post('/withdrawals/:id/confirm', async (req, res) => {
       if (nativeBalance < (netWei + networkFeeWei)) {
         db.prepare('UPDATE withdrawals SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?')
           .run('failed', 'insufficient platform native balance', new Date().toISOString(), id);
+        logAudit(performedBy, 'execute_failed', id, null, 'insufficient platform native balance');
         return res.status(400).json({ error: 'platform wallet has insufficient native balance for send + gas' });
       }
 
@@ -156,6 +184,8 @@ app.post('/withdrawals/:id/confirm', async (req, res) => {
 
       db.prepare('UPDATE withdrawals SET status = ?, updated_at = ? WHERE id = ?')
         .run('confirmed', new Date().toISOString(), id);
+
+      logAudit(performedBy, 'execute', id, txHash, 'native executed');
 
       const updated = db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
       return res.json({ id, txHash, status: updated.status });
@@ -176,6 +206,7 @@ app.post('/withdrawals/:id/confirm', async (req, res) => {
       if (tokenBalance < grossUnits) {
         db.prepare('UPDATE withdrawals SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?')
           .run('failed', 'insufficient platform token balance', new Date().toISOString(), id);
+        logAudit(performedBy, 'execute_failed', id, null, 'insufficient platform token balance');
         return res.status(400).json({ error: 'platform wallet has insufficient token balance' });
       }
 
@@ -184,6 +215,7 @@ app.post('/withdrawals/:id/confirm', async (req, res) => {
       if (nativeBalance < networkFeeWei) {
         db.prepare('UPDATE withdrawals SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?')
           .run('failed', 'insufficient native for gas', new Date().toISOString(), id);
+        logAudit(performedBy, 'execute_failed', id, null, 'insufficient native for gas');
         return res.status(400).json({ error: 'platform wallet has insufficient native balance for gas' });
       }
 
@@ -194,6 +226,8 @@ app.post('/withdrawals/:id/confirm', async (req, res) => {
       db.prepare('UPDATE withdrawals SET status = ?, updated_at = ? WHERE id = ?')
         .run('confirmed', new Date().toISOString(), id);
 
+      logAudit(performedBy, 'execute', id, txHash, 'erc20 executed');
+
       const updated = db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
       return res.json({ id, txHash, status: updated.status });
     }
@@ -201,6 +235,7 @@ app.post('/withdrawals/:id/confirm', async (req, res) => {
     console.error(err);
     db.prepare('UPDATE withdrawals SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?')
       .run('failed', String(err), new Date().toISOString(), req.params.id);
+    logAudit(req.admin && req.admin.token ? req.admin.token : 'unknown', 'execute_error', req.params.id, null, String(err));
     return res.status(500).json({ error: String(err) });
   }
 });
