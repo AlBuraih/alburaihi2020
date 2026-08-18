@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Clicker PoC</title>
+  <style>
+    body{font-family: Arial, sans-serif; padding:20px}
+    #game{ margin-top:20px }
+    #click-btn{ font-size:24px; padding:20px 40px }
+    #timer{ font-size:18px }
+  </style>
+</head>
+<body>
+  <h1>Clicker — Play & Earn (PoC)</h1>
+
+  <div id="auth">
+    <h3>Register / Login</h3>
+    <input id="email" placeholder="email" />
+    <input id="password" type="password" placeholder="password" />
+    <button id="btn-register">Register</button>
+    <button id="btn-login">Login</button>
+    <div id="me" style="margin-top:10px"></div>
+  </div>
+
+  <div id="wallet" style="margin-top:20px"></div>
+
+  <div id="game">
+    <button id="btn-start">Start Round (60s)</button>
+    <div id="round-area" style="display:none">
+      <div id="timer">Time: <span id="time-left">60</span>s</div>
+      <div style="margin-top:10px"><button id="click-btn">Click me</button></div>
+      <div style="margin-top:10px">Clicks: <span id="clicks">0</span></div>
+      <div style="margin-top:10px"><button id="btn-submit">Submit</button></div>
+    </div>
+  </div>
+
+  <div id="withdraw" style="margin-top:30px">
+    <h3>Withdraw</h3>
+    <input id="withdraw-amount" placeholder="amount (USDC)" />
+    <input id="withdraw-dest" placeholder="destination address" />
+    <button id="btn-withdraw">Request Withdraw</button>
+    <div id="withdraw-result"></div>
+  </div>
+
+  <script>
+    let token = null;
+    function setToken(t){ token = t; localStorage.setItem('clicker_token', t); }
+    function getToken(){ return token || localStorage.getItem('clicker_token'); }
+
+    document.getElementById('btn-register').onclick = async ()=>{
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      const res = await fetch('/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+      const j = await res.json();
+      if(j.token){ setToken(j.token); alert('Registered'); fetchMe(); }
+      else alert(JSON.stringify(j));
+    }
+
+    document.getElementById('btn-login').onclick = async ()=>{
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      const res = await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+      const j = await res.json();
+      if(j.token){ setToken(j.token); alert('Logged in'); fetchMe(); }
+      else alert(JSON.stringify(j));
+    }
+
+    async function fetchMe(){
+      const t = getToken();
+      if(!t) return;
+      const res = await fetch('/me',{headers:{'Authorization':'Bearer '+t}});
+      const j = await res.json();
+      if(j.user){ document.getElementById('me').innerText = 'Signed in: ' + j.user.email; document.getElementById('wallet').innerText = 'Balance: ' + (j.wallet.balance||'0') + ' USDC'; }
+    }
+
+    // game logic
+    let roundId = null; let clicks = 0; let timeLeft = 60; let timerInterval = null;
+    document.getElementById('btn-start').onclick = async ()=>{
+      const t = getToken(); if(!t){ alert('Login first'); return; }
+      const res = await fetch('/game/start',{method:'POST',headers:{'Authorization':'Bearer '+t}});
+      const j = await res.json();
+      roundId = j.roundId; clicks = 0; timeLeft = j.duration || 60;
+      document.getElementById('clicks').innerText = clicks;
+      document.getElementById('round-area').style.display = 'block';
+      document.getElementById('time-left').innerText = timeLeft;
+      timerInterval = setInterval(()=>{
+        timeLeft--; document.getElementById('time-left').innerText = timeLeft;
+        if(timeLeft<=0){ clearInterval(timerInterval); }
+      },1000);
+    }
+
+    document.getElementById('click-btn').onclick = ()=>{ clicks++; document.getElementById('clicks').innerText = clicks; }
+
+    document.getElementById('btn-submit').onclick = async ()=>{
+      const t = getToken(); if(!t){ alert('Login first'); return; }
+      clearInterval(timerInterval);
+      const duration = 60 - parseInt(document.getElementById('time-left').innerText || '0');
+      const res = await fetch('/game/submit',{method:'POST',headers:{'Authorization':'Bearer '+t,'Content-Type':'application/json'},body:JSON.stringify({roundId,clicks,duration})});
+      const j = await res.json();
+      if(j.reward){ alert('You earned ' + j.reward + ' USDC'); fetchMe(); }
+      else alert(JSON.stringify(j));
+      document.getElementById('round-area').style.display = 'none';
+    }
+
+    document.getElementById('btn-withdraw').onclick = async ()=>{
+      const t = getToken(); if(!t){ alert('Login first'); return; }
+      const amount = document.getElementById('withdraw-amount').value;
+      const dest = document.getElementById('withdraw-dest').value;
+      const res = await fetch('/withdrawals/create',{method:'POST',headers:{'Authorization':'Bearer '+t,'Content-Type':'application/json'},body:JSON.stringify({amount:parseFloat(amount),destination:dest})});
+      const j = await res.json();
+      document.getElementById('withdraw-result').innerText = JSON.stringify(j);
+    }
+
+    // init
+    (async ()=>{ if(localStorage.getItem('clicker_token')){ token = localStorage.getItem('clicker_token'); await fetchMe(); } })();
+  </script>
+</body>
+</html>
