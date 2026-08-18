@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  payouts:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - RPC_URL=${RPC_URL}
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PORT=3000
+      - PLATFORM_FEE_NATIVE=${PLATFORM_FEE_NATIVE}
+      - PLATFORM_FEE_TOKEN=${PLATFORM_FEE_TOKEN}
+      - USDC_TOKEN_ADDRESS=${USDC_TOKEN_ADDRESS}
+      - USDC_TOKEN_DECIMALS=${USDC_TOKEN_DECIMALS}
+    volumes:
+      - ./data:/app/data
