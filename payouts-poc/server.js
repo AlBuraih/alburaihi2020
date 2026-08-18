@@ -5,6 +5,7 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const { ethers } = require('ethers');
 const path = require('path');
+const jwt = require('jsonwebtoken');
 
 const db = require('./db');
 const {
@@ -22,8 +23,13 @@ const PLATFORM_FEE_TOKEN = process.env.PLATFORM_FEE_TOKEN || '1';
 const USDC_TOKEN_ADDRESS = process.env.USDC_TOKEN_ADDRESS || null;
 const USDC_TOKEN_DECIMALS = parseInt(process.env.USDC_TOKEN_DECIMALS || '6', 10);
 
-// Admin token (use a strong secret in production via env)
+// Admin token (legacy PoC support)
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'changeme';
+// Username/password + JWT for admins (PoC defaults)
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'password';
+const ADMIN_JWT_SECRET = process.env.ADMIN_JWT_SECRET || 'changeme_jwt_secret';
+const ADMIN_JWT_EXPIRES = process.env.ADMIN_JWT_EXPIRES || '1h';
 
 const provider = createProvider(RPC_URL);
 const wallet = createWallet(PRIVATE_KEY, provider);
@@ -32,24 +38,35 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Simple admin auth middleware (PoC only)
+// Simple admin auth middleware (accepts legacy ADMIN_TOKEN or JWT)
 function adminAuth(req, res, next) {
   const auth = req.headers['authorization'] || '';
   if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
   const token = auth.slice(7);
-  if (token !== ADMIN_TOKEN) return res.status(403).json({ error: 'Forbidden' });
-  // record token for audit
-  req.admin = { token };
-  next();
+
+  // legacy token support
+  if (token === ADMIN_TOKEN) {
+    req.admin = { token, username: 'legacy-token' };
+    return next();
+  }
+
+  // try JWT
+  try {
+    const payload = jwt.verify(token, ADMIN_JWT_SECRET);
+    req.admin = { token, username: payload.username };
+    return next();
+  } catch (e) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
 }
 
 // helper: log audit
-function logAudit(adminToken, action, withdrawalId, txHash, details) {
+function logAudit(adminTokenOrUser, action, withdrawalId, txHash, details) {
   try {
     const now = new Date().toISOString();
     const id = uuidv4();
     db.prepare(`INSERT INTO admin_audit (id, admin_token, action, withdrawal_id, tx_hash, details, created_at) VALUES (@id,@admin_token,@action,@withdrawal_id,@tx_hash,@details,@created_at)`).run({
-      id, admin_token: adminToken, action, withdrawal_id: withdrawalId, tx_hash: txHash || null, details: details || null, created_at: now
+      id, admin_token: adminTokenOrUser, action, withdrawal_id: withdrawalId, tx_hash: txHash || null, details: details || null, created_at: now
     });
   } catch (e) {
     console.error('audit log failed', e);
@@ -58,6 +75,15 @@ function logAudit(adminToken, action, withdrawalId, txHash, details) {
 
 // Serve admin static build if present
 app.use('/admin', express.static(path.join(__dirname, 'admin', 'build')));
+
+// Admin login: username/password -> returns JWT
+app.post('/admin/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  if (username !== ADMIN_USER || password !== ADMIN_PASS) return res.status(401).json({ error: 'invalid credentials' });
+  const token = jwt.sign({ username }, ADMIN_JWT_SECRET, { expiresIn: ADMIN_JWT_EXPIRES });
+  return res.json({ token, expiresIn: ADMIN_JWT_EXPIRES });
+});
 
 function insertWithdrawal(obj) {
   const now = new Date().toISOString();
@@ -155,7 +181,7 @@ app.post('/withdrawals/create', async (req, res) => {
 app.post('/withdrawals/:id/confirm', adminAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const performedBy = req.admin && req.admin.token ? req.admin.token : 'unknown';
+    const performedBy = req.admin && (req.admin.username || req.admin.token) ? (req.admin.username || req.admin.token) : 'unknown';
 
     const row = db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
     if (!row) return res.status(404).json({ error: 'withdrawal not found' });
@@ -235,7 +261,7 @@ app.post('/withdrawals/:id/confirm', adminAuth, async (req, res) => {
     console.error(err);
     db.prepare('UPDATE withdrawals SET status = ?, failure_reason = ?, updated_at = ? WHERE id = ?')
       .run('failed', String(err), new Date().toISOString(), req.params.id);
-    logAudit(req.admin && req.admin.token ? req.admin.token : 'unknown', 'execute_error', req.params.id, null, String(err));
+    logAudit(req.admin && (req.admin.username || req.admin.token) ? (req.admin.username || req.admin.token) : 'unknown', 'execute_error', req.params.id, null, String(err));
     return res.status(500).json({ error: String(err) });
   }
 });
